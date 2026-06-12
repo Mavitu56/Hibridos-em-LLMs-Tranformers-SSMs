@@ -1,6 +1,28 @@
-torch>=2.2.0
-mamba-ssm>=2.0.0
-tiktoken>=0.6.0
-datasets>=2.18.0
-transformers>=4.40.0
-numpy>=1.26.0
+# Dependências base (CPU/GPU).
+#
+# IMPORTANTE (Colab): NÃO reinstale o torch a partir daqui — o Colab já vem com
+# a build de torch casada com a CUDA do runtime. Reinstalar pode puxar um sdist
+# e quebrar o ambiente. Por isso torch NÃO está fixado aqui; assumimos o que o
+# Colab fornece. Localmente, instale torch separadamente conforme sua CUDA.
+#
+# Os kernels CUDA do Mamba (mamba-ssm, causal-conv1d) também NÃO entram aqui:
+# são instalados por wheel pré-compilada via setup_env.py (ou cai-se para o
+# backend torch puro). Ver CHANGELOG.md.
+#
+# Instale SEMPRE com --only-binary para o pip falhar alto em vez de tentar
+# compilar do source (causa do erro "Getting requirements to build wheel"):
+#     pip install --only-binary=:all: -r requirements.txt
+#
+# Limites superiores frouxos evitam que o resolvedor pegue um release recém-saído
+# sem wheel para o Python do Colab (ex.: tokenizers atrás de transformers).
+
+transformers>=4.44,<5      # fallback torch puro do Mamba-2 (Mamba2Mixer).
+                           # Pin <5: o wrapper foi validado contra a API 4.x
+                           # (em v5 o Mixer nasce com params torch.empty; o
+                           # blocks.py já cobre isso com init explícito).
+einops>=0.7                # exigido pelo mamba_ssm (backend kernels)
+tiktoken>=0.6              # GPT-2 BPE (tokenização do SlimPajama)
+datasets>=3.0,<6           # streaming do DKYoon/SlimPajama-6B (parquet puro).
+                           # Não fixar <3: forçaria downgrade de fsspec/hub no
+                           # Colab e o dataset funciona normalmente em 3.x/4.x.
+numpy>=1.26

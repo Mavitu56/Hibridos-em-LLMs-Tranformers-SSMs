@@ -10,6 +10,8 @@ Uso:
     logits, loss = model(input_ids, targets)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 from config import ModelConfig
@@ -71,8 +73,9 @@ class HybridModel(nn.Module):
         # Weight tying: embedding e lm_head compartilham a mesma matriz
         self.lm_head.weight = self.embedding.weight
 
-        # Inicialização dos pesos (estilo nanoGPT)
+        # Inicialização dos pesos (estilo nanoGPT/GPT-2).
         self.apply(self._init_weights)
+        self._scale_residual_projections()
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -81,6 +84,30 @@ class HybridModel(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _scale_residual_projections(self):
+        """
+        Init com escala por profundidade (GPT-2, Radford et al. 2019): os pesos
+        das projeções que escrevem de volta no fluxo residual são reescalados por
+        1/sqrt(2 * n_layers). Mantém a variância da soma residual ~constante ao
+        longo da profundidade e evita explosão de ativações — crítico para as
+        variantes ssm_only e hybrid_7_1, as mais propensas a 'nan' (Tarefa 3).
+
+        Cobrimos as projeções de saída de cada sub-bloco:
+            - GQA:  o_proj      (saída da atenção)
+            - MLP:  down_proj   (saída do MLP, em ambos os tipos de bloco)
+            - Mamba: out_proj   (saída do mixer; nome usado tanto pelo backend
+                                  kernels quanto pelo transformers)
+        """
+        scale = 1.0 / math.sqrt(2 * self.cfg.n_layers)
+        for name, p in self.named_parameters():
+            if name.endswith("weight") and p.dim() == 2 and (
+                name.endswith("o_proj.weight")
+                or name.endswith("down_proj.weight")
+                or name.endswith("out_proj.weight")
+            ):
+                with torch.no_grad():
+                    p.mul_(scale)
 
     def forward(
         self,
