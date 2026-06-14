@@ -34,10 +34,16 @@ import sys
 
 # Versões alvo dos releases (verificadas em 2026-06-12). As wheels destes
 # releases cobrem cu11/cu12/cu13 × torch 2.6–2.10 × cp310–cp313 × cxx11abi
-# TRUE/FALSE — incluindo o Colab atual (Python 3.12, torch 2.8, CUDA 12,
-# cxx11abi TRUE). Ajuste se um release mais novo casar melhor.
+# TRUE/FALSE. Ajuste se um release mais novo casar melhor.
 MAMBA_SSM_VERSION = "2.3.2.post1"
 CAUSAL_CONV1D_VERSION = "1.6.2.post1"
+
+# O Colab pode rodar um torch MAIS NOVO que a última wheel publicada (observado
+# em 2026-06-12: torch 2.11.0+cu128 no Colab; wheels só até torch2.10 → 404).
+# Extensões compiladas contra um libtorch minor anterior frequentemente importam
+# no seguinte; tentamos minors anteriores em ordem decrescente e deixamos o
+# SMOKE TEST decidir — se o import/forward falhar, cai para o backend torch.
+TORCH_FALLBACK_MINORS = ["2.10", "2.9", "2.8", "2.7", "2.6"]
 
 MAMBA_RELEASE_BASE = (
     "https://github.com/state-spaces/mamba/releases/download/"
@@ -129,10 +135,13 @@ def _pip_install(target: str) -> bool:
     return True
 
 
-def install_kernels(env: dict) -> bool:
+def install_kernels(env: dict, torch_mm: str = None) -> bool:
     """
     Instala causal-conv1d PRIMEIRO, depois mamba-ssm (ordem importa: mamba-ssm
     linka contra causal-conv1d). Devolve True se ambos instalarem.
+
+    torch_mm: sobrepõe o minor do torch no nome da wheel (fallback p/ quando o
+    torch do runtime é mais novo que a última wheel publicada).
     """
     if not env["cuda_available"]:
         print("  CUDA indisponível — kernels Mamba exigem GPU. Pulando para fallback.")
@@ -140,6 +149,11 @@ def install_kernels(env: dict) -> bool:
     if env["cu_short"] is None:
         print("  torch sem build CUDA — kernels não aplicáveis. Pulando para fallback.")
         return False
+
+    if torch_mm is not None and torch_mm != env["torch_mm"]:
+        env = {**env, "torch_mm": torch_mm}
+        print(f"  [fallback] tentando wheels compiladas p/ torch {torch_mm} "
+              f"(runtime tem {env['torch_ver']}; o smoke test decide).")
 
     urls = build_wheel_urls(env)
     print(f"  causal-conv1d: {urls['causal_conv1d']}")
@@ -150,6 +164,23 @@ def install_kernels(env: dict) -> bool:
     if not _pip_install(urls["mamba_ssm"]):
         return False
     return True
+
+
+def _torch_minor_candidates(env: dict) -> list:
+    """
+    Minors de torch a tentar no nome da wheel: o do runtime primeiro, depois os
+    anteriores (nunca um minor mais novo que o runtime — ABI futura não linka).
+    """
+    def as_tuple(mm: str):
+        major, minor = mm.split(".")[:2]
+        return (int(major), int(minor))
+
+    current = env["torch_mm"]
+    cands = [current]
+    for mm in TORCH_FALLBACK_MINORS:
+        if mm != current and as_tuple(mm) < as_tuple(current):
+            cands.append(mm)
+    return cands
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +253,13 @@ def setup(timebox_note: bool = True) -> str:
     backend = "torch"  # default conservador
 
     print("[1/2] Tentando instalar kernels CUDA por wheel pré-compilada...")
-    if install_kernels(env) and smoke_kernels():
+    kernels_ok = False
+    for torch_mm in _torch_minor_candidates(env):
+        if install_kernels(env, torch_mm) and smoke_kernels():
+            kernels_ok = True
+            break
+
+    if kernels_ok:
         backend = "kernels"
         print("✓ Backend KERNELS ativo (fast path do Mamba-2).")
     else:

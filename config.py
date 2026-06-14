@@ -73,6 +73,14 @@ class TrainConfig:
     batch_size: int = 16                    # Micro-batch por step
     grad_accumulation_steps: int = 8        # Batch efetivo = 128 sequências
 
+    # Micro-batch máximo quando MAMBA_BACKEND=torch e a variante tem blocos M.
+    # O torch_forward do Mamba2Mixer materializa um tensor O(B·T·chunk·h·p) em
+    # fp32 (~1 GiB por unidade de batch em T=1024): B=16 deu OOM até em A100
+    # 40GB (Fase A, 2026-06-12). train.py reduz batch_size até este teto e
+    # multiplica grad_accumulation_steps na mesma proporção — tokens/step e
+    # batch efetivo IDÊNTICOS (comparabilidade preservada). 0 = desativa.
+    mamba_torch_microbatch: int = 4
+
     # --- Orçamento de tokens (controla o "mesmo orçamento" entre variantes) ---
     # ~1.5B tokens: viável em Colab Pro, suficiente para perplexidade interpretável
     # e contraste no MQAR. max_steps deriva disto se não for passado explicitamente.

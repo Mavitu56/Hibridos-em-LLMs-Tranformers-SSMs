@@ -162,6 +162,23 @@ def train(variant_name: str, cfg: TrainConfig = None) -> dict:
     out_dir = cfg.out_dir
     print(f"[device] {device}  [dtype] {amp_dtype}")
     print(f"[backend] MAMBA_BACKEND={os.environ.get('MAMBA_BACKEND', 'torch (default)')}")
+    if device == "cuda":
+        torch.cuda.empty_cache()  # libera resíduos de runs anteriores na sessão
+
+    # --- Micro-batch adaptativo p/ backend torch puro com blocos Mamba ---
+    # O torch_forward do Mamba2Mixer materializa um tensor O(B·T·chunk·h·p) em
+    # fp32 (B=16, T=1024 → alocação única de ~16 GiB; OOM observado em A100
+    # 40GB na Fase A). Reduzimos batch_size e aumentamos grad_accum na MESMA
+    # proporção: tokens/step e batch efetivo idênticos => comparável entre
+    # variantes e backends. Ver TrainConfig.mamba_torch_microbatch.
+    backend = os.environ.get("MAMBA_BACKEND", "torch")
+    target_mb = cfg.mamba_torch_microbatch
+    if backend == "torch" and "M" in pattern and target_mb > 0:
+        while cfg.batch_size > target_mb and cfg.batch_size % 2 == 0:
+            cfg.batch_size //= 2
+            cfg.grad_accumulation_steps *= 2
+        print(f"[micro-batch] backend torch + blocos Mamba: batch_size={cfg.batch_size}, "
+              f"grad_accum={cfg.grad_accumulation_steps} (tokens/step inalterado)")
 
     # --- Modelo (init escalado por profundidade já aplicado no construtor) ---
     model = HybridModel(model_cfg).to(device)

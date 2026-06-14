@@ -233,3 +233,49 @@ Revisão completa do repositório antes do gate da Fase A. Correções aplicadas
 - **Throughput**: medir tok/s no smoke train e recalibrar `max_tokens` se o
   backend ativo for o torch puro (SSD sem kernels é várias vezes mais lento;
   1.5B tokens pode não caber no prazo — com kernels, viável).
+
+---
+
+## Fase A no Colab (2026-06-12) — resultados do gate e correções pós-run
+
+### Resultados (A100-SXM4-40GB, bf16, backend torch puro)
+
+- **Gate A2–A4 passou inteiro**: smoke de blocos sem nan, paridade
+  50.14–50.34M (spread 0.4%), selftests MQAR (oráculo 100%) e RULER OK,
+  dataloader OK, smoke train com queda de loss e resume funcionando.
+- **`attn_only` COMPLETOU o orçamento de 1.5B tokens**: 11 444 steps a
+  ~116k tok/s (~3h35 de A100), val_loss 3.42, **perplexidade 30.61**, sem nan.
+  Checkpoint em `hybrid_ckpts/attn_only/last.pt` — NÃO retreinar.
+- **Kernels: 404 na wheel.** O runtime do Colab subiu para **torch
+  2.11.0+cu12.8** e os releases (mai/2026) publicam wheels só até `torch2.10`.
+  O fallback torch puro assumiu corretamente.
+- **`ssm_only` e `hybrid_3_1`: OOM no 1º step.** O `torch_forward` do
+  `Mamba2Mixer` materializa `(M[..., None] * hidden_states[:, :, None])`
+  com shape (B, n_chunks, chunk, chunk, heads, head_dim) em fp32 — com B=16 e
+  T=1024 é UMA alocação de ~16 GiB; não cabe nem em A100 40GB.
+
+### Correções aplicadas
+
+- **setup_env.py — fallback de minor do torch nas wheels.** Quando o torch do
+  runtime é mais novo que a última wheel publicada, tenta as wheels dos minors
+  anteriores (2.10 → 2.9 → … → 2.6, nunca um minor mais novo); o smoke test
+  (import + forward em CUDA) decide se a ABI casa. Se nenhum casar, cai para o
+  backend torch como antes.
+- **train.py / config.py — micro-batch adaptativo no backend torch.** Com
+  `MAMBA_BACKEND=torch` e blocos `M` no padrão, `batch_size` é reduzido por
+  halving até `mamba_torch_microbatch` (default 4) e `grad_accumulation_steps`
+  é multiplicado na mesma proporção — **tokens/step e batch efetivo idênticos**
+  aos das demais variantes (comparabilidade preservada; muda só o quanto cabe
+  na GPU por passada). `torch.cuda.empty_cache()` no início de `train()` limpa
+  resíduos de runs anteriores na mesma sessão (o OOM da Fase B herdou memória
+  da tentativa falha do ssm_only).
+
+### Observação de viabilidade
+
+Com micro-batch 4 o backend torch deve caber com folga na A100, mas o
+throughput do SSD puro PyTorch é incógnita — **medir tok/s nos primeiros ~100
+steps do ssm_only**: abaixo de ~30k tok/s, o orçamento de 1.5B tokens custa
+>14h de A100 por variante Mamba (×4 variantes) e convém (a) priorizar o
+caminho de kernels via fallback de minor, (b) reduzir `max_tokens` para todas
+as variantes (attn_only incluída, retreinada no orçamento menor), ou (c)
+treinar fora do Colab. Decisão a registrar quando houver o número medido.

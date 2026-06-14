@@ -103,6 +103,11 @@ hybrid-ssm-lm/
   `F.scaled_dot_product_attention` (Flash; sem matriz T×T explícita).
 - **Sharding por worker no dataloader** (IterableDataset; evita stream duplicado)
   e **held-out de validação cacheado em memória** (`get_val_batches`).
+- **Micro-batch adaptativo no backend torch** (`mamba_torch_microbatch=4`): o
+  torch_forward do Mamba2Mixer aloca ~1 GiB/unidade de batch em T=1024 (OOM em
+  A100 com B=16); train.py reduz batch e multiplica grad_accum — tokens/step
+  idêntico. setup_env tenta wheels de minors anteriores do torch se o runtime
+  for mais novo que a última wheel (Colab jun/2026: torch 2.11 vs wheels ≤2.10).
 - **Paridade por `d_ff` dual:** `d_ff` (atenção) e `d_ff_mamba` (menor) igualam a
   contagem por bloco mantendo `d_model` compartilhado.
 - **Init escalado por profundidade** (`1/sqrt(2·n_layers)`) nas projeções
