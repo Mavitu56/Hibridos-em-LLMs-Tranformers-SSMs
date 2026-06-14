@@ -91,6 +91,10 @@ def save_checkpoint(model, optimizer, step, tokens_seen, train_cfg, model_cfg, o
             "optim_state": optimizer.state_dict(),
             "model_cfg": model_cfg,
             "train_cfg": train_cfg,
+            # Backend grava nomes de parâmetros DIFERENTES no mixer Mamba
+            # (kernels: mixer.mamba.* ; torch: mixer.mixer.*). Registramos para
+            # o resume recusar um checkpoint de outro backend em vez de quebrar.
+            "mamba_backend": os.environ.get("MAMBA_BACKEND", "torch"),
         },
         tmp,
     )
@@ -105,8 +109,34 @@ def load_checkpoint(out_dir, model, optimizer, device):
     if not os.path.exists(path):
         return 0, 0
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
-    optimizer.load_state_dict(ckpt["optim_state"])
+
+    # O nome dos parâmetros do mixer Mamba depende do backend (kernels:
+    # mixer.mamba.* ; torch: mixer.mixer.*). Um checkpoint de outro backend
+    # NÃO carrega (load_state_dict quebra). Detectamos e começamos do zero em
+    # vez de derrubar a run — o checkpoint antigo é sobrescrito no 1º save.
+    ckpt_backend = ckpt.get("mamba_backend")
+    cur_backend = os.environ.get("MAMBA_BACKEND", "torch")
+    # Só há conflito se a variante tem blocos Mamba (o GQA é igual nos dois
+    # backends — attn_only treinado em 'torch' carrega em 'kernels' sem dor).
+    has_mamba = "M" in getattr(ckpt.get("model_cfg"), "block_pattern", [])
+    if has_mamba and ckpt_backend is not None and ckpt_backend != cur_backend:
+        print(
+            f"[resume] checkpoint em {path} foi salvo com backend "
+            f"'{ckpt_backend}', mas o ativo é '{cur_backend}'. "
+            f"Pesos incompatíveis — IGNORANDO o checkpoint e começando do zero."
+        )
+        return 0, 0
+    try:
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optim_state"])
+    except RuntimeError as e:
+        # Rede de segurança p/ checkpoints antigos sem o campo mamba_backend.
+        print(
+            f"[resume] FALHA ao carregar {path} ({type(e).__name__}). "
+            f"Provável incompatibilidade de backend/arquitetura. "
+            f"IGNORANDO o checkpoint e começando do zero."
+        )
+        return 0, 0
     step = ckpt.get("step", 0)
     tokens_seen = ckpt.get("tokens_seen", 0)
     print(f"[resume] retomando de {path}: step {step}, {tokens_seen/1e9:.3f}B tokens")
