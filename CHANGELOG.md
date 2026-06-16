@@ -331,3 +331,44 @@ Faltam `hybrid_5_1` e `hybrid_7_1` (Fase C). Paridade 50.14–50.34M, sem nan.
   de rodar este sweep. Se o gap atenção↔SSM abrir com seq_len/n_pairs, a medição
   estava certa e o treino não muda (segue Fase C). Se permanecer chato no grid
   inteiro, aí há evidência para investigar treino/dados.
+
+### Resultado do sweep (Colab, L4, kernels) — hipótese central CONFIRMADA
+
+O grid resolveu o diagnóstico: **o gap de recall abre monotonicamente com
+`n_pairs`** (carga de memória associativa), exatamente como Zoology (Arora 2023)
+prevê. Em seq_len=1024 (acaso=0.002):
+
+| n_pairs | attn_only | hybrid_3_1 | ssm_only |
+|---------|-----------|------------|----------|
+| 4       | 0.349     | 0.380      | 0.309    |
+| 8       | 0.392     | 0.367      | 0.282    |
+| 16      | 0.361     | 0.335      | 0.192    |
+| 32      | 0.288     | 0.249      | 0.083    |
+| 64      | 0.217     | 0.181      | 0.024    |
+
+O `ssm_only` despenca para perto do acaso (estado recorrente de tamanho fixo
+satura); a atenção degrada com graça. O ponto único da phase_b (n_pairs=8)
+caía no regime em que as arquiteturas mais se parecem — por isso o gap parecia
+pequeno. **`seq_len` é inerte** no MQAR atual (pares empacotados contíguos no
+início + PAD; a distância não varia, só a quantidade) — a variável de estresse
+efetiva é `n_pairs`. Registrar como limitação do gerador MQAR.
+
+### NIAH — artefato encontrado e corrigido (eval/ruler.py)
+
+- **[BUG de avaliação] `attn_only` zerava no NIAH (0/800)** enquanto Mamba/híbrido
+  pontuavam — paradoxal (atenção global deveria liderar NIAH). Causa: o palheiro
+  era `[FILLER] * haystack_len`, ou seja **um ÚNICO token repetido por ~80% da
+  sequência**. Nenhum LM treinado em texto natural vê isso, e é ADVERSÁRIO à
+  atenção: uma sequência constante colapsa o padrão causal (todas as chaves/
+  valores iguais → a query não destaca a agulha). O Mamba é robusto (seleção via
+  Δt ignora o ruído). O RULER real (NVIDIA, Hsieh et al. 2024) usa ruído VARIADO
+  (frases de ruído / ensaios), nunca um token único.
+- **Correção:** palheiro agora amostra de um vocabulário de `n_filler=64`
+  tokens-distrator DISJUNTO de chaves/valores (sem colisão com agulhas). Validado:
+  oráculo do MQAR resolve o NIAH corrigido a 100% (labels intactos); o selftest
+  do ruler.py passou a checar isto por oráculo (antes só conferia shapes).
+- **Impacto:** o resultado NIAH da run de 15/jun (attn=0.000) é INVÁLIDO (artefato);
+  re-rodar o sweep após esta correção. O MQAR daquela run permanece VÁLIDO (gerador
+  não tocado) e é o resultado principal. NIAH-corrigido (pré-correção, mesmos
+  pesos): hybrid_3_1 ~0.13–0.17, ssm_only ~0.003 — o híbrido já liderava; espera-se
+  que o attn_only suba para a faixa de topo após a correção do palheiro.

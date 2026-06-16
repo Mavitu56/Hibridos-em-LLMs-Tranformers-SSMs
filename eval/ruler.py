@@ -31,13 +31,27 @@ def _layout(vocab_size):
 
 
 def generate_niah(n_examples=200, seq_len=1024, n_keys=8, n_queries=4,
-                  vocab_size=512, device="cpu", seed=42):
-    """Multi-key NIAH: agulhas (k,v) espalhadas em enchimento; consulta no fim."""
+                  vocab_size=512, device="cpu", seed=42, n_filler=64):
+    """Multi-key NIAH: agulhas (k,v) espalhadas em enchimento; consulta no fim.
+
+    Enchimento = RUÍDO VARIADO (auditoria 2026-06-16). Antes o palheiro era um
+    ÚNICO token `FILLER` repetido por todo o haystack (~80% da sequência) — uma
+    distribuição que nenhum LM treinado em texto natural vê e que é ADVERSÁRIA à
+    atenção: uma sequência de tokens idênticos colapsa o padrão causal (todas as
+    chaves/valores iguais → a query não destaca a agulha no mar de FILLER). Isso
+    fazia o `attn_only` zerar no NIAH (0/800) enquanto Mamba/híbrido pontuavam —
+    paradoxal e contrário à literatura. O RULER real (NVIDIA, Hsieh et al. 2024)
+    usa ruído VARIADO (frases de ruído ou ensaios), não um token único. Aqui o
+    palheiro é amostrado de um vocabulário de `n_filler` tokens-distrator
+    DISJUNTO do espaço de chaves/valores (não há colisão possível com as agulhas).
+    """
     rng = random.Random(seed)
     ko, vo, total = _layout(vocab_size)
-    # tokens de enchimento: usamos um token neutro reservado fora de chaves/valores.
-    FILLER = total
-    total += 1
+    # Vocabulário de distratores: `n_filler` tokens reservados FORA de
+    # [chaves, valores]. Disjunto → o modelo nunca confunde ruído com agulha.
+    filler_lo = total
+    filler_vocab = list(range(filler_lo, filler_lo + n_filler))
+    total += n_filler
 
     X, L = [], []
     for _ in range(n_examples):
@@ -52,12 +66,13 @@ def generate_niah(n_examples=200, seq_len=1024, n_keys=8, n_queries=4,
         if haystack_len < 2 * n_keys:
             raise ValueError("seq_len pequeno demais para as agulhas + queries.")
 
+        # palheiro = ruído variado (cada posição um distrator sorteado).
+        seq = [rng.choice(filler_vocab) for _ in range(haystack_len)]
         # posições aleatórias para as agulhas no palheiro. Sorteamos slots em
         # posições PARES (slot=2j) para que (chave em 2j, valor em 2j+1) nunca
         # colida com a agulha vizinha — antes, slots adjacentes sobrescreviam o
         # valor da agulha anterior (~6% dos exemplos), criando um teto
         # silencioso de acurácia (auditoria 2026-06-12).
-        seq = [FILLER] * haystack_len
         slots = sorted(2 * j for j in rng.sample(range(haystack_len // 2), n_keys))
         for slot, k in zip(slots, keys):
             seq[slot] = ko + k
@@ -143,16 +158,34 @@ def evaluate_ruler(model, task="niah", batch_size=32, device="cpu", **gen_kw) ->
 
 
 def selftest() -> bool:
-    """Gera ambas as tarefas e confere que há posições supervisionadas e shapes ok."""
+    """Confere shapes, posições supervisionadas E corretude dos labels (oráculo).
+
+    A checagem por oráculo é o que valida a mudança do palheiro (ruído variado):
+    o oráculo do MQAR lê os pares (chave, valor) adjacentes e responde — só
+    atinge 100% se os labels seguirem alinhados e o ruído NÃO colidir com as
+    agulhas. Cobre o NIAH e o Variable Tracking.
+    """
+    from eval.mqar import _OracleModel
     ok = True
+
     xi, li, _ = generate_niah(n_examples=8, seq_len=256, n_keys=4, n_queries=2, vocab_size=64)
     sup = (li[:, :-1] != -1).sum().item()
     print(f"[niah] inputs {tuple(xi.shape)} supervisionadas={sup}")
     ok = ok and xi.shape == (8, 256) and sup == 8 * 2  # 2 queries por exemplo
+
+    # Oráculo deve resolver o NIAH a 100% (labels corretos, ruído sem colisão).
+    orac = _OracleModel()
+    logits, _ = orac(xi[:, :-1])
+    mask = li[:, :-1] != -1
+    acc_niah = (logits.argmax(-1)[mask] == li[:, :-1][mask]).float().mean().item()
+    print(f"[niah] oráculo acc={acc_niah:.3f} (esperado 1.000)")
+    ok = ok and abs(acc_niah - 1.0) < 1e-9
+
     xv, lv, _ = generate_var_tracking(n_examples=8, seq_len=128, n_hops=3, vocab_size=64)
     supv = (lv[:, :-1] != -1).sum().item()
     print(f"[vt]   inputs {tuple(xv.shape)} supervisionadas={supv}")
     ok = ok and xv.shape == (8, 128) and supv == 8  # 1 query por exemplo
+
     print("  ✓ selftest OK" if ok else "  ✗ selftest FALHOU")
     return ok
 
