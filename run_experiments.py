@@ -154,6 +154,55 @@ def phase_b(out_root="checkpoints"):
 
 
 # ---------------------------------------------------------------------------
+# Fase B+ — varredura de recall (diagnóstico do gap atenção↔SSM)
+# ---------------------------------------------------------------------------
+
+def phase_b_recall(out_root="checkpoints", variants=None, out_dir=None):
+    """
+    Varredura de recall sobre os checkpoints JÁ treinados (só inferência).
+
+    Por que isto existe (CHANGELOG, "Avaliação 2026-06-16"): o MQAR de ponto
+    único da phase_b (seq_len=128, n_pairs=8) não distingue "não há efeito" de
+    "medi no regime onde as arquiteturas se parecem". Aqui varremos o MQAR em
+    (seq_len × n_pairs) e o NIAH em vários seq_len, com nível de acaso reportado
+    — a curva de Zoology (Arora 2023), não um número solto. Não retreina nada.
+
+    Roda nos checkpoints que existirem; pula silenciosamente os ausentes (ex.:
+    hybrid_5_1/7_1 antes da Fase C).
+    """
+    print("\n##### FASE B+ — varredura de recall (MQAR grid + NIAH) #####")
+    _ensure_backend()
+    from eval.recall_sweep import sweep_checkpoint
+
+    variants = variants or ("attn_only", "ssm_only", "hybrid_3_1",
+                            "hybrid_5_1", "hybrid_7_1")
+    out_dir = out_dir or os.path.join(out_root, "_recall_results")
+    summary = {}
+    for v in variants:
+        path = os.path.join(out_root, v, "last.pt")
+        if not os.path.exists(path):
+            print(f"  [pulado] {v}: checkpoint ausente ({path})")
+            continue
+        print(f"\n--- recall sweep: {v} ---")
+        res = sweep_checkpoint(path, out_dir=out_dir)
+        # Resumo enxuto: a célula MQAR mais difícil viável (maior seq_len/n_pairs).
+        cells = res["mqar_grid"]["cells"]
+        hardest = max(cells, key=lambda c: (c["seq_len"], c["n_pairs"])) if cells else None
+        summary[v] = {
+            "mqar_hardest_cell": hardest,
+            "chance": res["mqar_grid"]["chance_level"],
+            "out_path": res.get("out_path"),
+        }
+    print(f"\nResumo Fase B+ (célula MQAR mais difícil por variante):")
+    for v, s in summary.items():
+        hc = s["mqar_hardest_cell"]
+        if hc:
+            print(f"  {v}: seq_len={hc['seq_len']} n_pairs={hc['n_pairs']} "
+                  f"acc={hc['accuracy']:.4f} (acaso={s['chance']:.4f})")
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Fase C — upside
 # ---------------------------------------------------------------------------
 
@@ -170,7 +219,7 @@ def phase_c(out_root="checkpoints"):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["a", "b", "c"], default="a")
+    parser.add_argument("--phase", choices=["a", "b", "b_recall", "c"], default="a")
     parser.add_argument("--out_root", default="checkpoints")
     parser.add_argument("--no_baselines", action="store_true")
     args = parser.parse_args()
@@ -178,5 +227,7 @@ if __name__ == "__main__":
         phase_a(args.out_root, run_baselines=not args.no_baselines)
     elif args.phase == "b":
         phase_b(args.out_root)
+    elif args.phase == "b_recall":
+        phase_b_recall(args.out_root)
     else:
         phase_c(args.out_root)

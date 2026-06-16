@@ -279,3 +279,55 @@ steps do ssm_only**: abaixo de ~30k tok/s, o orçamento de 1.5B tokens custa
 caminho de kernels via fallback de minor, (b) reduzir `max_tokens` para todas
 as variantes (attn_only incluída, retreinada no orçamento menor), ou (c)
 treinar fora do Colab. Decisão a registrar quando houver o número medido.
+
+---
+
+## Fase A+B no Colab (2026-06-15) — run completa com backend KERNELS
+
+### Resultados (NVIDIA L4, bf16, backend **kernels**)
+
+O fallback de minor do torch nas wheels (registrado acima) **funcionou**: torch
+2.11 deu 404, o setup tentou as wheels de torch 2.10, o smoke forward passou e o
+backend ativo foi **kernels** (não torch puro). Sem OOM. As três variantes do
+núcleo treinaram o orçamento de 1.5B tokens (11 444 steps):
+
+| Variante   | val ppl | MQAR acc (ponto único) | throughput |
+|------------|---------|------------------------|------------|
+| attn_only  | 30.61   | 0.393                  | —          |
+| hybrid_3_1 | 29.07   | 0.372                  | ~30k tok/s |
+| ssm_only   | 32.60   | 0.277                  | ~110k tok/s|
+
+Faltam `hybrid_5_1` e `hybrid_7_1` (Fase C). Paridade 50.14–50.34M, sem nan.
+
+### Leitura crítica (insumo da discussão do TCC)
+
+- **PPL na ordem esperada** (Jamba): híbrido < atenção pura < SSM puro. O ganho
+  de PPL do `hybrid_3_1` sobre o `attn_only` é o achado mais sólido.
+- **O gap de recall SSM↔atenção é PEQUENO** (0.393 vs 0.277) — não o colapso que
+  Zoology (Arora et al. 2023) prevê — e o `hybrid_3_1` NÃO supera o `attn_only`
+  no MQAR. Suspeita forte de **artefato de medição**, não resultado: o MQAR foi
+  avaliado num ÚNICO ponto (seq_len=128, n_pairs=8) — justamente o regime em que
+  as arquiteturas mais se parecem — e sem nível de acaso reportado. Em Zoology o
+  gap só *abre* ao varrer seq_len/n_pairs.
+
+## Avaliação 2026-06-16 — varredura de recall (eval/recall_sweep.py)
+
+- **NOVO `eval/recall_sweep.py`** (só inferência; não retreina): varre o MQAR num
+  GRID (seq_len × n_pairs) e o NIAH do RULER em vários seq_len, reportando o
+  **nível de acaso** (1/vocab_size) e contagens por célula. Reaproveita os
+  geradores já validados (`generate_mqar_examples`, `evaluate_ruler`) **sem
+  alterar a interface pública**; a semântica de avaliação (argmax no vocab
+  inteiro, `model(x[:,:-1])` vs `labels[:,:-1]`) é idêntica. Inclui `--selftest`
+  com o modelo-oráculo (1.0 em toda célula viável; pula células onde o prefixo
+  não cabe). **Por quê:** decidir se o gap pequeno é treino subótimo ou medição
+  no regime errado exige a CURVA de Zoology, não um ponto. É o teste que
+  distingue "não há efeito" de "medi no lugar errado" — pré-requisito para
+  qualquer mudança no treino.
+- **NOVO `run_experiments.phase_b_recall(out_root)`**: runner inline (estilo
+  `phase_b`, sem `!python`) que roda o sweep sobre os checkpoints existentes no
+  Drive e salva um JSON por variante; pula os ausentes (5_1/7_1 antes da Fase C).
+  CLI: `--phase b_recall`.
+- **Decisão de sequência (metodológica):** NÃO se altera o código de TREINO antes
+  de rodar este sweep. Se o gap atenção↔SSM abrir com seq_len/n_pairs, a medição
+  estava certa e o treino não muda (segue Fase C). Se permanecer chato no grid
+  inteiro, aí há evidência para investigar treino/dados.
