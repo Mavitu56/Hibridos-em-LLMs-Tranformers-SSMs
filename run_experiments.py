@@ -215,14 +215,35 @@ def phase_b_recall(out_root="checkpoints", variants=None, out_dir=None):
 # Fase C — upside
 # ---------------------------------------------------------------------------
 
-def phase_c(out_root="checkpoints"):
+def phase_c(out_root="checkpoints", variants=("hybrid_5_1", "hybrid_7_1"),
+            run_sweep=True):
+    """
+    Treina as variantes que faltam (default 5_1 e 7_1) no MESMO orçamento das
+    demais (1.5B tokens; max_steps derivado por train.py → 11444 steps, idêntico
+    a attn_only/ssm_only/hybrid_3_1) e, ao final, roda o sweep de recall correto.
+
+    Seguro a quedas de sessão: o resume é por checkpoint (train.py). Reentrar a
+    phase_c continua de onde parou; uma variante cujo last.pt já atingiu max_steps
+    retoma e sai no 1º save sem retreinar (comportamento observado na Fase A).
+    """
     print("\n##### FASE C — upside #####")
     _ensure_backend()
+
+    # Gate de paridade (regra nº 1 do projeto: nunca treinar fora de banda).
+    # Barato (só conta params) e evita queimar horas de GPU numa config torta.
+    import check_parity
+    assert check_parity.check_all_variants(), "paridade fora de ±5% — abortando Fase C."
+
     from train import train
-    for v in ("hybrid_5_1", "hybrid_7_1"):
+    for v in variants:
         print(f"\n--- treinar {v} ---")
         train(v, _train_cfg(os.path.join(out_root, v)))
-    print("Fase C: rode evaluate.py com --benchmarks perplexity,mqar,lambada,hellaswag,ruler")
+
+    if run_sweep:
+        print("\n--- Fase C: varredura de recall (inclui 5_1/7_1 agora treinados) ---")
+        phase_b_recall(out_root)
+    else:
+        print("Fase C concluída. Rode R.phase_b_recall(out_root) para o sweep final.")
 
 
 if __name__ == "__main__":

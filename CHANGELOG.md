@@ -448,10 +448,34 @@ por oráculo (acc=1.0 nos dois modos e em todos os seq_len) e end-to-end.
 - JSONs em `MyDrive/hybrid_ckpts/_recall_results/`.
 
 ### O que falta
-1. **Re-rodar `phase_b_recall`** para gravar os JSONs no formato novo (PPL + os
-   dois grids MQAR + NIAH num arquivo só) — os JSONs atuais têm o formato antigo.
+1. ~~Re-rodar `phase_b_recall` no formato novo~~ — FEITO (2026-06-17). Os 3 JSONs
+   (PPL + mqar_grid_pack + mqar_grid_gap + niah_sweep) estão em
+   `MyDrive/hybrid_ckpts/_recall_results/`, verificados no Drive.
 2. **Fase C — treinar `hybrid_5_1` e `hybrid_7_1`** (`R.phase_c`): completa o eixo
    da proporção (5 pontos) e cobre o sweet spot ~1:7 da literatura (Jamba/Nemotron-H).
 3. **Sweep final** incluindo 5_1/7_1 (o runner os pega automaticamente).
 4. Benchmarks secundários (lambada/hellaswag) e Variable Tracking do RULER, se
    houver orçamento — opcionais para o TCC.
+
+### Resultado do eixo DISTÂNCIA (MQAR gap, 2026-06-17) — colapso total do SSM
+
+O modo `gap` (distância chave→query ~ seq_len) revelou o resultado mais decisivo:
+o SSM colapsa MAIS pela distância do que pela carga. Em n_pairs=8, variando a
+distância (acaso=0.002):
+
+| seq_len | attn_only | hybrid_3_1 | ssm_only |
+|---------|-----------|------------|----------|
+| 64      | 0.316     | 0.283      | 0.143    |
+| 128     | 0.262     | 0.235      | 0.058    |
+| 256     | 0.224     | 0.202      | 0.019    |
+| 512     | 0.176     | 0.138      | 0.007    |
+| 1024    | 0.242     | 0.116      | 0.001    |
+
+O `ssm_only` chega ao ACASO (0.001) a ~1000 tokens de distância — o estado
+recorrente de tamanho fixo "esquece" o par. A atenção é ~plana na distância
+(acesso global); o híbrido degrada intermediário. **Os dois eixos de Zoology
+(carga + distância) estão demonstrados.** Quadro consolidado das 3 variantes:
+recall colapsa no SSM (pior na distância), atenção robusta, híbrido no meio;
+PPL de texto o híbrido vence (29.07 < 30.61 < 32.60). Nota: `attn_only` tem
+não-monotonia leve em seq_len=512→1024 (0.176→0.242), provável extrapolação de
+RoPE perto do block_size=1024 de treino — registrar como nota de rodapé.
