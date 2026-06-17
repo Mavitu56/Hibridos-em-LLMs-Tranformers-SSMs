@@ -479,3 +479,25 @@ recall colapsa no SSM (pior na distância), atenção robusta, híbrido no meio;
 PPL de texto o híbrido vence (29.07 < 30.61 < 32.60). Nota: `attn_only` tem
 não-monotonia leve em seq_len=512→1024 (0.176→0.242), provável extrapolação de
 RoPE perto do block_size=1024 de treino — registrar como nota de rodapé.
+
+## data/dataloader.py — num_workers=0 por padrão (2026-06-17)
+
+- **[BUG de ambiente] Treino do `hybrid_5_1` travou no Colab (A100): 15 min sem
+  log nem uso de GPU, parado logo após "Iniciando treino...".** Diagnóstico
+  isolou a causa: `load_dataset(streaming=True)` e o 1º documento respondem em
+  ~2s em processo único, mas `make_dataloader` usava `num_workers=2` →
+  multiprocessing, e cada worker reabre o stream HF no 1º `next()`. No Colab
+  esses subprocessos travam silenciosamente (erros/prints suprimidos) e o 1º
+  batch nunca chega — daí GPU em 0% e nenhum log (o 1º log só sai no step 20).
+- **Correção:** `make_dataloader(..., num_workers=0)` por padrão — o stream roda
+  no processo principal (confiável). O gargalo real é a GPU, não a CPU/IO (o
+  tok/s das runs anteriores não era CPU-bound), então o impacto no throughput é
+  mínimo. `num_workers>0` continua disponível (reativa o sharding por documento).
+- **Nota de comparabilidade (metodologia):** com `num_workers=2` o
+  `_stream_tokens` repartia `max_tokens` entre 2 shards e cada worker via
+  documentos alternados (`i % 2`); com `num_workers=0` o processo vê TODOS os
+  documentos até `max_tokens`. **Tokens treinados idênticos (1.5B); o conjunto de
+  documentos amostrados difere** entre as 3 variantes já treinadas (workers=2) e
+  as novas 5_1/7_1 (workers=0). Efeito desprezível — 1.5B é uma fração mínima do
+  SlimPajama-6B i.i.d.; ambas são amostras aleatórias representativas. Registrado
+  por transparência; não justifica retreinar as 3 anteriores.

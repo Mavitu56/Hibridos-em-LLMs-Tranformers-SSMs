@@ -113,14 +113,19 @@ def make_dataloader(
     train_cfg: TrainConfig,
     model_cfg: ModelConfig,
     split: str = "train",
-    num_workers: int = 2,
+    num_workers: int = 0,
 ) -> DataLoader:
     """
     DataLoader sobre o SlimPajama em streaming.
 
-    No treino, múltiplos workers são particionados por documento (ver
-    _stream_tokens) — sem duplicação de dados. Para validação usa
-    num_workers=0 (held-out determinístico). pin_memory acelera CPU->GPU.
+    num_workers=0 por padrão (decisão 2026-06-17): com workers > 0 o DataLoader
+    usa multiprocessing e cada worker reabre o stream HF no 1º next(); no Colab
+    isso TRAVOU silenciosamente o hybrid_5_1 (15 min sem log nem uso de GPU,
+    enquanto load_dataset/1º documento em processo único respondem em ~2s). Com
+    num_workers=0 o stream roda no processo principal — confiável; o gargalo é a
+    GPU (o tok/s das runs anteriores não era limitado por CPU). Para reativar o
+    sharding por worker, passe num_workers>0 explicitamente (ver _stream_tokens).
+    Validação sempre usa 0 (held-out determinístico). pin_memory acelera CPU->GPU.
     """
     if split == "validation":
         num_workers = 0
