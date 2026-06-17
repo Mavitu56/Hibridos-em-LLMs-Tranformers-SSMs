@@ -185,20 +185,29 @@ def phase_b_recall(out_root="checkpoints", variants=None, out_dir=None):
             continue
         print(f"\n--- recall sweep: {v} ---")
         res = sweep_checkpoint(path, out_dir=out_dir)
-        # Resumo enxuto: a célula MQAR mais difícil viável (maior seq_len/n_pairs).
-        cells = res["mqar_grid"]["cells"]
-        hardest = max(cells, key=lambda c: (c["seq_len"], c["n_pairs"])) if cells else None
+        # Resumo enxuto: célula MQAR-pack mais difícil (maior carga) + PPL + NIAH 1024.
+        cells = res["mqar_grid_pack"]["cells"]
+        hardest = max(cells, key=lambda c: (c["n_pairs"], c["seq_len"])) if cells else None
+        niah_cells = res["niah_sweep"]["cells"]
+        niah_long = max(niah_cells, key=lambda c: c["seq_len"]) if niah_cells else None
         summary[v] = {
+            "ppl": (res["perplexity"] or {}).get("perplexity"),
             "mqar_hardest_cell": hardest,
-            "chance": res["mqar_grid"]["chance_level"],
+            "niah_longest": niah_long,
+            "chance": res["mqar_grid_pack"]["chance_level"],
             "out_path": res.get("out_path"),
         }
-    print(f"\nResumo Fase B+ (célula MQAR mais difícil por variante):")
+    print(f"\nResumo Fase B+ (PPL, MQAR-pack mais difícil, NIAH mais longo):")
     for v, s in summary.items():
         hc = s["mqar_hardest_cell"]
-        if hc:
-            print(f"  {v}: seq_len={hc['seq_len']} n_pairs={hc['n_pairs']} "
-                  f"acc={hc['accuracy']:.4f} (acaso={s['chance']:.4f})")
+        nl = s["niah_longest"]
+        ppl = s["ppl"]
+        ppl_s = f"ppl={ppl:.2f}" if ppl is not None else "ppl=?"
+        mqar_s = (f"MQAR n_pairs={hc['n_pairs']} acc={hc['accuracy']:.4f}"
+                  if hc else "MQAR=?")
+        niah_s = (f"NIAH@{nl['seq_len']}={nl['ruler_niah_accuracy']:.4f}"
+                  if nl else "NIAH=?")
+        print(f"  {v}: {ppl_s} | {mqar_s} | {niah_s} (acaso={s['chance']:.4f})")
     return summary
 
 

@@ -367,8 +367,91 @@ efetiva é `n_pairs`. Registrar como limitação do gerador MQAR.
   tokens-distrator DISJUNTO de chaves/valores (sem colisão com agulhas). Validado:
   oráculo do MQAR resolve o NIAH corrigido a 100% (labels intactos); o selftest
   do ruler.py passou a checar isto por oráculo (antes só conferia shapes).
-- **Impacto:** o resultado NIAH da run de 15/jun (attn=0.000) é INVÁLIDO (artefato);
-  re-rodar o sweep após esta correção. O MQAR daquela run permanece VÁLIDO (gerador
-  não tocado) e é o resultado principal. NIAH-corrigido (pré-correção, mesmos
-  pesos): hybrid_3_1 ~0.13–0.17, ssm_only ~0.003 — o híbrido já liderava; espera-se
-  que o attn_only suba para a faixa de topo após a correção do palheiro.
+- **Impacto:** o resultado NIAH da run de 15/jun (attn=0.000) era INVÁLIDO (artefato).
+  O MQAR daquela run permanece VÁLIDO (gerador não tocado) e é o resultado principal.
+
+### Re-run do sweep com NIAH corrigido (2026-06-16) — paradoxo resolvido
+
+Re-rodado sobre os MESMOS checkpoints (só o gerador NIAH mudou). O `attn_only`
+saiu de 0.000 para a faixa de topo, ordenação agora coerente com a literatura
+(atenção > híbrido ≫ SSM em recall longo):
+
+| NIAH seq_len | attn_only | hybrid_3_1 | ssm_only | acaso |
+|--------------|-----------|------------|----------|-------|
+| 256          | 0.236     | 0.203      | 0.023    | 0.002 |
+| 512          | 0.184     | 0.125      | 0.010    | 0.002 |
+| 1024         | 0.225     | 0.126      | 0.006    | 0.002 |
+
+O `ssm_only` cola no acaso (estado fixo não retém agulhas espalhadas). MQAR
+inalterado (confirma a estabilidade do gerador). **Quadro final do TCC:** em
+recall puro (MQAR/NIAH) a atenção lidera e o SSM colapsa sob carga (Zoology,
+Arora 2023); em PPL de texto natural o híbrido vence ambos os extremos —
+29.07 < 30.61 (attn) < 32.60 (ssm) — (Jamba). Trade-off memória↔atenção
+demonstrado com paridade ~50M (±0.4%) e 1.5B tokens. Falta a Fase C (5_1/7_1)
+para a curva completa da proporção.
+
+## Melhorias de avaliação 2026-06-17 — distância (MQAR gap_fill) + PPL no JSON
+
+Duas melhorias aplicadas (só avaliação; treino intocado). Validadas localmente
+por oráculo (acc=1.0 nos dois modos e em todos os seq_len) e end-to-end.
+
+### 1. `seq_len` efetivo no MQAR — modo `gap_fill` (eval/mqar.py)
+
+- **Limitação corrigida:** no MQAR clássico os pares ficavam contíguos no início
+  e o resto era PAD, então `seq_len` NÃO alterava a distância chave→query — a
+  única variável de estresse era `n_pairs` (CARGA). Isso explica por que o eixo
+  `seq_len` saía inerte no primeiro sweep.
+- **`generate_mqar_examples(..., gap_fill=False, n_filler=64)`** (parâmetro novo,
+  default retrocompatível). Com `gap_fill=True`, tokens-distrator variados (espaço
+  DISJUNTO de chaves/valores) são intercalados ENTRE os pares, empurrando as
+  chaves para longe das queries → a distância escala com `seq_len` (estilo RULER).
+  Chave e valor permanecem ADJACENTES (o ruído vai entre pares), preservando os
+  labels. Verificado: SEP migra de 47→239→1007 para seq_len 64→256→1024.
+- **`_OracleModel`** passou a parear por janela deslizante de passo 1
+  (`kv[t]=t+1`), robusta ao ruído (pares espúrios entram no dict mas nunca são
+  consultados; chave→valor sempre registrado). Resolve os DOIS modos a 100%.
+- **Interpretação:** agora há DOIS eixos ortogonais — `n_pairs` (carga, modo pack)
+  e `seq_len` (distância, modo gap). Zoology mostra o gap SSM↔atenção abrindo em
+  ambos; o pack já confirmou a carga, o gap mede a distância.
+
+### 2. Sweep consolidado + perplexidade (eval/recall_sweep.py)
+
+- **`sweep_checkpoint` agora roda os DOIS grids** (`mqar_grid_pack` +
+  `mqar_grid_gap`) e inclui a **perplexidade** no val fixo (`with_perplexity=True`,
+  reusa `eval/perplexity.py`). Um único JSON por variante reúne PPL + MQAR(carga)
+  + MQAR(distância) + NIAH — Resultados do TCC saem de um arquivo só.
+- **`phase_b_recall`** atualizado: resumo por variante imprime PPL, célula MQAR-pack
+  mais difícil e NIAH mais longo. JSON renomeia `mqar_grid`→`mqar_grid_pack`/`_gap`.
+- Selftests de `eval/mqar.py`, `eval/ruler.py` e `eval/recall_sweep.py` cobrem
+  ambos os modos por oráculo; todos passam.
+
+---
+
+## Estado do repositório, resultados e pendências (síntese 2026-06-17)
+
+### O que foi feito no repositório (avaliação; treino intocado)
+- `eval/recall_sweep.py` (NOVO): grid MQAR em dois modos (carga/distância), sweep
+  NIAH, perplexidade e nível de acaso; JSON consolidado por variante; `--selftest`.
+- `eval/mqar.py`: modo `gap_fill` (distância ~ seq_len); oráculo robusto a ruído.
+- `eval/ruler.py`: palheiro NIAH agora é ruído variado (corrige o artefato do
+  FILLER único que zerava o `attn_only`); selftest valida labels por oráculo.
+- `run_experiments.py`: `phase_b_recall()` + CLI `--phase b_recall`.
+- `train.py`/`config.py`/`model.py`/`blocks.py`: **NÃO alterados** — nenhum
+  problema de treino foi identificado; os dois artefatos eram de avaliação.
+
+### Resultados registrados (run 2026-06-15, L4, kernels, 1.5B tokens, ~50M ±0.4%)
+- **Perplexidade (texto):** hybrid_3_1 **29.07** < attn_only 30.61 < ssm_only 32.60.
+- **MQAR (carga, n_pairs↑, seq_len=1024):** attn ≥ hybrid ≫ ssm; ssm cai a ~acaso
+  (0.024 em n_pairs=64) — colapso de Zoology confirmado.
+- **NIAH corrigido (distância):** attn 0.225 > hybrid 0.126 ≫ ssm 0.006 (@1024).
+- **Leitura:** recall puro → atenção lidera; LM de texto → híbrido vence ambos.
+- JSONs em `MyDrive/hybrid_ckpts/_recall_results/`.
+
+### O que falta
+1. **Re-rodar `phase_b_recall`** para gravar os JSONs no formato novo (PPL + os
+   dois grids MQAR + NIAH num arquivo só) — os JSONs atuais têm o formato antigo.
+2. **Fase C — treinar `hybrid_5_1` e `hybrid_7_1`** (`R.phase_c`): completa o eixo
+   da proporção (5 pontos) e cobre o sweet spot ~1:7 da literatura (Jamba/Nemotron-H).
+3. **Sweep final** incluindo 5_1/7_1 (o runner os pega automaticamente).
+4. Benchmarks secundários (lambada/hellaswag) e Variable Tracking do RULER, se
+   houver orçamento — opcionais para o TCC.

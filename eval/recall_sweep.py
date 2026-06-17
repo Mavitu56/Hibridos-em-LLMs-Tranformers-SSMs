@@ -65,12 +65,13 @@ def _chance_level(vocab_size: int) -> float:
 
 @torch.no_grad()
 def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
-                    batch_size, device):
+                    batch_size, device, gap_fill=False):
     """
     Avalia UMA célula do grid MQAR. Mesma semântica de eval.mqar.evaluate_mqar
     (model(x[:,:-1]) vs labels[:,:-1], argmax no vocab inteiro), mas separada
     aqui para variar seq_len/n_pairs e devolver contagens cruas.
     Retorna None se a célula for inviável (prefixo não cabe em seq_len).
+    gap_fill=True intercala ruído entre pares → distância chave→query ~ seq_len.
     """
     # Prefixo = 2*n_pairs (pares) + 1 (SEP); precisa sobrar >=2 p/ uma query.
     if 2 * n_pairs + 1 + 2 > seq_len:
@@ -79,7 +80,7 @@ def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
     model.eval()
     inputs, labels, total_vocab = generate_mqar_examples(
         n_examples=n_examples, seq_len=seq_len, n_pairs=n_pairs,
-        vocab_size=vocab_size, device=device,
+        vocab_size=vocab_size, device=device, gap_fill=gap_fill,
     )
     correct = total = 0
     for i in range(0, n_examples, batch_size):
@@ -99,30 +100,38 @@ def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
         "seq_len": seq_len, "n_pairs": n_pairs, "vocab_size": vocab_size,
         "accuracy": acc, "correct": correct, "total": total,
         "n_examples": n_examples, "total_vocab": total_vocab,
+        "gap_fill": gap_fill,
     }
 
 
 @torch.no_grad()
 def mqar_grid(model, seq_lens=DEFAULT_SEQ_LENS, n_pairs_list=DEFAULT_N_PAIRS,
               vocab_size=DEFAULT_VOCAB_SIZE, n_examples=DEFAULT_N_EXAMPLES,
-              batch_size=64, device="cpu", verbose=True):
-    """Varre o MQAR em (seq_len × n_pairs). Retorna lista de células + meta."""
+              batch_size=64, device="cpu", verbose=True, gap_fill=False):
+    """Varre o MQAR em (seq_len × n_pairs). Retorna lista de células + meta.
+
+    gap_fill=False (default): pares contíguos; só `n_pairs` estressa o recall
+    (varia CARGA associativa). gap_fill=True: ruído entre pares, distância
+    chave→query ~ seq_len → o eixo `seq_len` mede DISTÂNCIA (estilo RULER).
+    """
     cells, skipped = [], []
     for sl in seq_lens:
         for npr in n_pairs_list:
             cell = _eval_mqar_cell(model, sl, npr, vocab_size, n_examples,
-                                   batch_size, device)
+                                   batch_size, device, gap_fill=gap_fill)
             if cell is None:
                 skipped.append({"seq_len": sl, "n_pairs": npr,
                                 "reason": "prefixo nao cabe em seq_len"})
                 continue
             cells.append(cell)
             if verbose:
-                print(f"  MQAR seq_len={sl:>5} n_pairs={npr:>3} | "
+                tag = "gap" if gap_fill else "pack"
+                print(f"  MQAR[{tag}] seq_len={sl:>5} n_pairs={npr:>3} | "
                       f"acc={cell['accuracy']:.4f} "
                       f"({cell['correct']}/{cell['total']})")
     return {
         "task": "mqar_grid",
+        "gap_fill": gap_fill,
         "chance_level": _chance_level(vocab_size),
         "vocab_size": vocab_size,
         "cells": cells,
@@ -164,10 +173,16 @@ def niah_sweep(model, seq_lens=DEFAULT_NIAH_SEQ_LENS, n_keys=8, n_queries=4,
 # ---------------------------------------------------------------------------
 
 def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
-                     mqar_kwargs=None, niah_kwargs=None, save=True):
+                     mqar_kwargs=None, niah_kwargs=None, save=True,
+                     with_perplexity=True, ppl_n_batches=50):
     """
-    Carrega um checkpoint e roda o grid MQAR + sweep NIAH. Persiste um JSON
-    nomeado pela variante e step. Importável e chamável inline no Colab.
+    Carrega um checkpoint e roda: grid MQAR em DOIS modos (pack/gap), sweep NIAH
+    e (opcional) a perplexidade no val fixo. Persiste UM JSON por variante —
+    assim Resultados do TCC saem de um arquivo só. Importável e inline no Colab.
+
+    Modos do grid MQAR:
+      - pack: pares contíguos → o eixo `n_pairs` mede CARGA associativa.
+      - gap:  ruído entre pares → o eixo `seq_len` mede DISTÂNCIA (estilo RULER).
 
     O nome dos parâmetros do mixer Mamba depende do backend (kernels: mixer.mamba.*;
     torch: mixer.mixer.*); load_state_dict quebra se o backend ATIVO divergir do
@@ -177,12 +192,13 @@ def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from config import TrainConfig  # noqa: F401 (mantém compat. de unpickle)
+    from config import TrainConfig
     from model import HybridModel
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_cfg = ckpt["model_cfg"]
+    train_cfg = ckpt.get("train_cfg", TrainConfig())
     step = ckpt.get("step", 0)
     pattern = model_cfg.block_pattern
     variant = f"{pattern.count('M')}:{pattern.count('A')}"
@@ -201,9 +217,22 @@ def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
     model.load_state_dict(ckpt["model_state"])
     print(model.describe())
 
+    mq = dict(mqar_kwargs or {})
+    mq.pop("gap_fill", None)  # controlamos os dois modos aqui
+
     t0 = time.time()
-    mqar = mqar_grid(model, device=device, **(mqar_kwargs or {}))
+    mqar_pack = mqar_grid(model, device=device, gap_fill=False, **mq)
+    mqar_gap = mqar_grid(model, device=device, gap_fill=True, **mq)
     niah = niah_sweep(model, device=device, **(niah_kwargs or {}))
+
+    ppl = None
+    if with_perplexity:
+        from eval.perplexity import eval_perplexity
+        print("  perplexidade (val fixo)...")
+        ppl = eval_perplexity(model, model_cfg, train_cfg, device,
+                              n_batches=ppl_n_batches)
+        print(f"  perplexidade={ppl['perplexity']:.2f} "
+              f"(avg_loss={ppl['avg_loss']:.4f}, {ppl['tokens']} tok)")
     dt = time.time() - t0
 
     results = {
@@ -212,7 +241,9 @@ def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
         "step": step,
         "mamba_backend": ckpt_backend,
         "elapsed_s": round(dt, 1),
-        "mqar_grid": mqar,
+        "perplexity": ppl,
+        "mqar_grid_pack": mqar_pack,
+        "mqar_grid_gap": mqar_gap,
         "niah_sweep": niah,
     }
 
@@ -265,6 +296,23 @@ def selftest() -> bool:
         ok = False
     print(f"  chance_level reportado = {res['chance_level']:.5f} (esperado {1/64:.5f})")
     ok = ok and abs(res["chance_level"] - 1 / 64) < 1e-9
+
+    # Modo gap_fill=True: o oráculo também deve dar 1.0 (labels intactos sob ruído).
+    print("[selftest] grid MQAR gap_fill=True (distância) com oráculo...")
+    res_gap = mqar_grid(
+        _OracleModel(),
+        seq_lens=(64, 128, 256),
+        n_pairs_list=(4, 8),
+        vocab_size=64, n_examples=32, batch_size=16, device="cpu",
+        verbose=True, gap_fill=True,
+    )
+    for c in res_gap["cells"]:
+        if not (c["total"] > 0 and abs(c["accuracy"] - 1.0) < 1e-9):
+            print(f"  [FALHA] gap célula seq_len={c['seq_len']} n_pairs={c['n_pairs']} "
+                  f"acc={c['accuracy']} (esperado 1.0)")
+            ok = False
+    ok = ok and res_gap.get("gap_fill") is True and len(res_gap["cells"]) > 0
+
     print("  [OK] selftest passou" if ok else "  [FALHA] selftest falhou")
     return ok
 

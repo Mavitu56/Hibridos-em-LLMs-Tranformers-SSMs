@@ -51,6 +51,8 @@ def generate_mqar_examples(
     vocab_size: int = 512,
     device: str = "cpu",
     seed: int = 42,
+    gap_fill: bool = False,
+    n_filler: int = 64,
 ):
     """
     Gera (inputs, labels, total_vocab).
@@ -59,9 +61,23 @@ def generate_mqar_examples(
                 ver docstring do módulo). Posições não-resposta = -1.
                 Para uso: model(inputs[:, :-1]) é comparado a labels[:, :-1].
         total_vocab: tamanho de vocabulário necessário (chaves + valores + reservados).
+
+    gap_fill (decisão 2026-06-16): controla se `seq_len` afeta a DISTÂNCIA.
+        - False (default, retrocompatível): pares empacotados contíguos no início,
+          resto vira PAD. Aqui `seq_len` NÃO altera a distância chave→query — a
+          variável de estresse efetiva é só `n_pairs`. Mantido como default para
+          o oráculo/selftest e para comparabilidade com runs anteriores.
+        - True: tokens-distrator variados (espaço DISJUNTO de chaves/valores) são
+          intercalados entre os pares para PREENCHER o contexto até seq_len. Assim
+          a distância entre uma chave no prefixo e sua query no fim cresce com
+          seq_len — isola o efeito de DISTÂNCIA (estilo RULER), não só de carga.
     """
     rng = random.Random(seed)
     key_offset, value_offset, total_vocab = _vocab_layout(vocab_size)
+    filler_lo = total_vocab
+    if gap_fill:
+        total_vocab += n_filler  # reserva o espaço de distratores (disjunto)
+    filler_vocab = list(range(filler_lo, filler_lo + n_filler))
 
     all_inputs, all_labels = [], []
     for _ in range(n_examples):
@@ -71,17 +87,35 @@ def generate_mqar_examples(
 
         seq, label = [], []
 
-        # Prefixo: pares (chave, valor)
-        for k, v in zip(keys, values):
-            seq.append(key_offset + k); label.append(-1)
-            seq.append(value_offset + v); label.append(-1)
-        seq.append(SEP_TOKEN); label.append(-1)
+        # Bloco de query no fim: 2 tokens por query + 1 (SEP) antes dele.
+        n_queries = min(n_pairs, max(0, (seq_len - (2 * n_pairs + 1)) // 2))
+        query_keys = rng.sample(keys, n_queries) if n_queries > 0 else []
+        query_block_len = 1 + 2 * n_queries  # SEP + (chave, resposta) por query
 
-        # Sufixo: queries. Cada query = (chave, resposta). A posição da CHAVE
-        # deve prever a RESPOSTA (token seguinte), por isso label na chave = ai.
-        remaining = seq_len - len(seq)
-        n_queries = min(n_pairs, remaining // 2)
-        query_keys = rng.sample(keys, n_queries)
+        if gap_fill and n_queries > 0:
+            # Orçamento de enchimento a distribuir ENTRE os pares do prefixo,
+            # empurrando as chaves para longe das queries (distância ~ seq_len).
+            budget = seq_len - (2 * n_pairs) - query_block_len
+            budget = max(0, budget)
+            # Reparte o budget em n_pairs+1 lacunas (antes/entre/depois dos pares).
+            gaps = [0] * (n_pairs + 1)
+            for _ in range(budget):
+                gaps[rng.randrange(n_pairs + 1)] += 1
+            for gi, (k, v) in enumerate(zip(keys, values)):
+                seq += [rng.choice(filler_vocab) for _ in range(gaps[gi])]
+                label += [-1] * gaps[gi]
+                seq.append(key_offset + k); label.append(-1)
+                seq.append(value_offset + v); label.append(-1)
+            seq += [rng.choice(filler_vocab) for _ in range(gaps[n_pairs])]
+            label += [-1] * gaps[n_pairs]
+        else:
+            # Prefixo contíguo (comportamento clássico).
+            for k, v in zip(keys, values):
+                seq.append(key_offset + k); label.append(-1)
+                seq.append(value_offset + v); label.append(-1)
+
+        # Bloco de query (idêntico nos dois modos).
+        seq.append(SEP_TOKEN); label.append(-1)
         for qk in query_keys:
             ans = value_offset + kv[qk]
             seq.append(key_offset + qk); label.append(ans)  # chave prevê resposta
@@ -112,12 +146,17 @@ def evaluate_mqar(
     vocab_size: int = 512,
     batch_size: int = 64,
     device: str = "cpu",
+    gap_fill: bool = False,
 ) -> dict:
-    """Avalia accuracy@1 nas posições de resposta do MQAR."""
+    """Avalia accuracy@1 nas posições de resposta do MQAR.
+
+    gap_fill=True intercala ruído entre os pares (a distância chave→query escala
+    com seq_len). Ver generate_mqar_examples. Default False = comportamento clássico.
+    """
     model.eval()
     inputs, labels, total_vocab = generate_mqar_examples(
         n_examples=n_examples, seq_len=seq_len, n_pairs=n_pairs,
-        vocab_size=vocab_size, device=device,
+        vocab_size=vocab_size, device=device, gap_fill=gap_fill,
     )
 
     correct = total = 0
@@ -168,12 +207,15 @@ class _OracleModel:
             # value_offset = KEY_OFFSET + vocab_size; inferimos vocab_size pelos
             # tokens do prefixo: chaves em [2, 2+vs), valores em [2+vs, 2+2vs).
             # Em vez de inferir vs, montamos o mapa por posição: pares (k, v).
+            # Pareamento por janela DESLIZANTE de passo 1 (kv[t] = t+1) sobre todo
+            # o prefixo. Robusto ao modo gap_fill (ruído entre pares): chave e
+            # valor são SEMPRE adjacentes no gerador, então kv[chave]=valor é
+            # sempre registrado; pares espúrios (ruído→x) entram no dicionário mas
+            # nunca são consultados (a query só pergunta chaves reais). No modo
+            # contíguo (passo implícito 2) o resultado é idêntico.
             kv = {}
-            j = 0
-            while j + 1 < sep:
-                k_tok, v_tok = seq[j], seq[j + 1]
-                kv[k_tok] = v_tok
-                j += 2
+            for j in range(sep - 1):
+                kv[seq[j]] = seq[j + 1]
             # para cada chave de query no sufixo, a previsão na posição da chave
             # (que vira input[t]; prevê t+1) deve ser o valor.
             for t in range(sep, T):
