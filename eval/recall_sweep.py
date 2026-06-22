@@ -51,6 +51,22 @@ DEFAULT_N_PAIRS = (4, 8, 16, 32, 64)
 DEFAULT_VOCAB_SIZE = 512        # mesmo default do evaluate.py (comparabilidade)
 DEFAULT_N_EXAMPLES = 512        # por célula; suficiente p/ estabilizar accuracy@1
 DEFAULT_NIAH_SEQ_LENS = (256, 512, 1024)
+# Multi-seed: cada (seq_len, n_pairs) é reavaliado com N conjuntos de exemplos
+# gerados por seeds distintas. Reportamos média ± desvio-padrão (barras de erro)
+# — necessário para afirmar diferenças entre variantes (ex.: 5_1 vs 7_1) em vez
+# de comparar pontos únicos sujeitos à variância do gerador. seeds fixas =>
+# reprodutível. n_seeds=1 reproduz o comportamento de ponto único anterior.
+DEFAULT_SEEDS = (0, 1, 2, 3, 4)
+
+
+def _mean_std(xs):
+    """Média e desvio-padrão amostral (ddof=1) de uma lista de floats."""
+    n = len(xs)
+    m = sum(xs) / n
+    if n < 2:
+        return m, 0.0
+    var = sum((x - m) ** 2 for x in xs) / (n - 1)
+    return m, var ** 0.5
 
 
 def _chance_level(vocab_size: int) -> float:
@@ -64,23 +80,12 @@ def _chance_level(vocab_size: int) -> float:
 
 
 @torch.no_grad()
-def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
-                    batch_size, device, gap_fill=False):
-    """
-    Avalia UMA célula do grid MQAR. Mesma semântica de eval.mqar.evaluate_mqar
-    (model(x[:,:-1]) vs labels[:,:-1], argmax no vocab inteiro), mas separada
-    aqui para variar seq_len/n_pairs e devolver contagens cruas.
-    Retorna None se a célula for inviável (prefixo não cabe em seq_len).
-    gap_fill=True intercala ruído entre pares → distância chave→query ~ seq_len.
-    """
-    # Prefixo = 2*n_pairs (pares) + 1 (SEP); precisa sobrar >=2 p/ uma query.
-    if 2 * n_pairs + 1 + 2 > seq_len:
-        return None
-
-    model.eval()
+def _eval_mqar_once(model, seq_len, n_pairs, vocab_size, n_examples,
+                    batch_size, device, gap_fill, seed):
+    """Accuracy@1 de UMA seed (um conjunto de exemplos). Retorna (acc, correct, total)."""
     inputs, labels, total_vocab = generate_mqar_examples(
         n_examples=n_examples, seq_len=seq_len, n_pairs=n_pairs,
-        vocab_size=vocab_size, device=device, gap_fill=gap_fill,
+        vocab_size=vocab_size, device=device, gap_fill=gap_fill, seed=seed,
     )
     correct = total = 0
     for i in range(0, n_examples, batch_size):
@@ -94,31 +99,59 @@ def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
         preds = logits.argmax(dim=-1)
         correct += (preds[mask] == target[mask]).sum().item()
         total += int(mask.sum().item())
-
     acc = correct / total if total > 0 else float("nan")
+    return acc, correct, total, total_vocab
+
+
+@torch.no_grad()
+def _eval_mqar_cell(model, seq_len, n_pairs, vocab_size, n_examples,
+                    batch_size, device, gap_fill=False, seeds=DEFAULT_SEEDS):
+    """
+    Avalia UMA célula do grid MQAR sobre N seeds e agrega média ± desvio.
+    Mesma semântica de eval.mqar.evaluate_mqar (model(x[:,:-1]) vs labels[:,:-1],
+    argmax no vocab inteiro); separada aqui para variar seq_len/n_pairs/seed.
+    Retorna None se a célula for inviável (prefixo não cabe em seq_len).
+    gap_fill=True intercala ruído entre pares → distância chave→query ~ seq_len.
+    """
+    # Prefixo = 2*n_pairs (pares) + 1 (SEP); precisa sobrar >=2 p/ uma query.
+    if 2 * n_pairs + 1 + 2 > seq_len:
+        return None
+
+    model.eval()
+    per_seed, total_vocab = [], None
+    for s in seeds:
+        acc, _, _, total_vocab = _eval_mqar_once(
+            model, seq_len, n_pairs, vocab_size, n_examples,
+            batch_size, device, gap_fill, seed=s,
+        )
+        per_seed.append(acc)
+    mean, std = _mean_std(per_seed)
     return {
         "seq_len": seq_len, "n_pairs": n_pairs, "vocab_size": vocab_size,
-        "accuracy": acc, "correct": correct, "total": total,
-        "n_examples": n_examples, "total_vocab": total_vocab,
-        "gap_fill": gap_fill,
+        "accuracy": mean, "acc_std": std, "acc_per_seed": per_seed,
+        "n_seeds": len(seeds), "n_examples": n_examples,
+        "total_vocab": total_vocab, "gap_fill": gap_fill,
     }
 
 
 @torch.no_grad()
 def mqar_grid(model, seq_lens=DEFAULT_SEQ_LENS, n_pairs_list=DEFAULT_N_PAIRS,
               vocab_size=DEFAULT_VOCAB_SIZE, n_examples=DEFAULT_N_EXAMPLES,
-              batch_size=64, device="cpu", verbose=True, gap_fill=False):
-    """Varre o MQAR em (seq_len × n_pairs). Retorna lista de células + meta.
+              batch_size=64, device="cpu", verbose=True, gap_fill=False,
+              seeds=DEFAULT_SEEDS):
+    """Varre o MQAR em (seq_len × n_pairs), multi-seed. Retorna células + meta.
 
-    gap_fill=False (default): pares contíguos; só `n_pairs` estressa o recall
-    (varia CARGA associativa). gap_fill=True: ruído entre pares, distância
-    chave→query ~ seq_len → o eixo `seq_len` mede DISTÂNCIA (estilo RULER).
+    Cada célula é média ± desvio sobre `seeds` (barras de erro). gap_fill=False
+    (default): pares contíguos; só `n_pairs` estressa o recall (CARGA). gap_fill=
+    True: ruído entre pares, distância chave→query ~ seq_len → `seq_len` mede
+    DISTÂNCIA (estilo RULER).
     """
     cells, skipped = [], []
     for sl in seq_lens:
         for npr in n_pairs_list:
             cell = _eval_mqar_cell(model, sl, npr, vocab_size, n_examples,
-                                   batch_size, device, gap_fill=gap_fill)
+                                   batch_size, device, gap_fill=gap_fill,
+                                   seeds=seeds)
             if cell is None:
                 skipped.append({"seq_len": sl, "n_pairs": npr,
                                 "reason": "prefixo nao cabe em seq_len"})
@@ -127,13 +160,14 @@ def mqar_grid(model, seq_lens=DEFAULT_SEQ_LENS, n_pairs_list=DEFAULT_N_PAIRS,
             if verbose:
                 tag = "gap" if gap_fill else "pack"
                 print(f"  MQAR[{tag}] seq_len={sl:>5} n_pairs={npr:>3} | "
-                      f"acc={cell['accuracy']:.4f} "
-                      f"({cell['correct']}/{cell['total']})")
+                      f"acc={cell['accuracy']:.4f} ± {cell['acc_std']:.4f} "
+                      f"(n={cell['n_seeds']})")
     return {
         "task": "mqar_grid",
         "gap_fill": gap_fill,
         "chance_level": _chance_level(vocab_size),
         "vocab_size": vocab_size,
+        "seeds": list(seeds),
         "cells": cells,
         "skipped": skipped,
     }
@@ -142,28 +176,42 @@ def mqar_grid(model, seq_lens=DEFAULT_SEQ_LENS, n_pairs_list=DEFAULT_N_PAIRS,
 @torch.no_grad()
 def niah_sweep(model, seq_lens=DEFAULT_NIAH_SEQ_LENS, n_keys=8, n_queries=4,
                vocab_size=DEFAULT_VOCAB_SIZE, n_examples=200, batch_size=16,
-               device="cpu", verbose=True):
-    """RULER-NIAH em vários seq_len: recall com distância chave→query LONGA."""
+               device="cpu", verbose=True, seeds=DEFAULT_SEEDS):
+    """RULER-NIAH em vários seq_len, multi-seed: recall com distância LONGA.
+
+    Cada seq_len é média ± desvio sobre `seeds` (o seed entra no gerador via
+    evaluate_ruler -> generate_niah).
+    """
     cells = []
     for sl in seq_lens:
         # NIAH exige seq_len >= 2*n_keys + bloco de query; pula se não couber.
         if sl < 2 * n_keys + (2 * min(n_queries, n_keys) + 1):
             continue
-        out = evaluate_ruler(
-            model, task="niah", batch_size=batch_size, device=device,
-            n_examples=n_examples, seq_len=sl, n_keys=n_keys,
-            n_queries=n_queries, vocab_size=vocab_size,
-        )
-        out["seq_len"] = sl
-        cells.append(out)
+        per_seed, total_vocab = [], None
+        for s in seeds:
+            out = evaluate_ruler(
+                model, task="niah", batch_size=batch_size, device=device,
+                n_examples=n_examples, seq_len=sl, n_keys=n_keys,
+                n_queries=n_queries, vocab_size=vocab_size, seed=s,
+            )
+            per_seed.append(out["ruler_niah_accuracy"])
+            total_vocab = out.get("total_vocab")
+        mean, std = _mean_std(per_seed)
+        cell = {
+            "seq_len": sl, "ruler_niah_accuracy": mean, "acc_std": std,
+            "acc_per_seed": per_seed, "n_seeds": len(seeds),
+            "n_examples": n_examples, "n_keys": n_keys, "n_queries": n_queries,
+            "vocab_size": vocab_size, "total_vocab": total_vocab,
+        }
+        cells.append(cell)
         if verbose:
             print(f"  NIAH seq_len={sl:>5} | "
-                  f"acc={out['ruler_niah_accuracy']:.4f} "
-                  f"({out['correct']}/{out['total']})")
+                  f"acc={mean:.4f} ± {std:.4f} (n={len(seeds)})")
     return {
         "task": "niah_sweep",
         "chance_level": _chance_level(vocab_size),
         "vocab_size": vocab_size,
+        "seeds": list(seeds),
         "cells": cells,
     }
 
@@ -174,15 +222,20 @@ def niah_sweep(model, seq_lens=DEFAULT_NIAH_SEQ_LENS, n_keys=8, n_queries=4,
 
 def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
                      mqar_kwargs=None, niah_kwargs=None, save=True,
-                     with_perplexity=True, ppl_n_batches=50):
+                     with_perplexity=True, ppl_n_batches=50, seeds=DEFAULT_SEEDS):
     """
     Carrega um checkpoint e roda: grid MQAR em DOIS modos (pack/gap), sweep NIAH
-    e (opcional) a perplexidade no val fixo. Persiste UM JSON por variante —
-    assim Resultados do TCC saem de um arquivo só. Importável e inline no Colab.
+    (todos MULTI-SEED, média ± desvio) e (opcional) a perplexidade no val fixo.
+    Persiste UM JSON por variante — Resultados do TCC saem de um arquivo só.
+    Importável e inline no Colab.
 
     Modos do grid MQAR:
       - pack: pares contíguos → o eixo `n_pairs` mede CARGA associativa.
       - gap:  ruído entre pares → o eixo `seq_len` mede DISTÂNCIA (estilo RULER).
+
+    seeds: conjunto de seeds do gerador sintético; cada célula vira média ±
+    desvio sobre elas (barras de erro). Aplicado a MQAR e NIAH, salvo se já
+    passado explicitamente em mqar_kwargs/niah_kwargs.
 
     O nome dos parâmetros do mixer Mamba depende do backend (kernels: mixer.mamba.*;
     torch: mixer.mixer.*); load_state_dict quebra se o backend ATIVO divergir do
@@ -219,11 +272,14 @@ def sweep_checkpoint(checkpoint_path, out_dir="results", device=None,
 
     mq = dict(mqar_kwargs or {})
     mq.pop("gap_fill", None)  # controlamos os dois modos aqui
+    mq.setdefault("seeds", seeds)
+    nk = dict(niah_kwargs or {})
+    nk.setdefault("seeds", seeds)
 
     t0 = time.time()
     mqar_pack = mqar_grid(model, device=device, gap_fill=False, **mq)
     mqar_gap = mqar_grid(model, device=device, gap_fill=True, **mq)
-    niah = niah_sweep(model, device=device, **(niah_kwargs or {}))
+    niah = niah_sweep(model, device=device, **nk)
 
     ppl = None
     if with_perplexity:
@@ -274,21 +330,30 @@ def selftest() -> bool:
     """
     from eval.mqar import _OracleModel
 
-    print("[selftest] grid MQAR com modelo-oráculo (deve dar 1.0 em toda célula)...")
+    SEEDS = (0, 1, 2)  # poucas seeds: rápido, mas exercita a agregação multi-seed
+
+    def _check_oracle_cells(cells, label):
+        ok = len(cells) > 0
+        for c in cells:
+            # Oráculo: média 1.0, desvio 0.0, e o registro multi-seed presente.
+            if not (abs(c["accuracy"] - 1.0) < 1e-9 and abs(c["acc_std"]) < 1e-9
+                    and c["n_seeds"] == len(SEEDS)
+                    and len(c["acc_per_seed"]) == len(SEEDS)
+                    and all(abs(a - 1.0) < 1e-9 for a in c["acc_per_seed"])):
+                print(f"  [FALHA] {label} seq_len={c['seq_len']} n_pairs={c['n_pairs']} "
+                      f"acc={c['accuracy']} std={c['acc_std']} per_seed={c['acc_per_seed']}")
+                ok = False
+        return ok
+
+    print("[selftest] grid MQAR pack, multi-seed, com oráculo (média 1.0 / dp 0.0)...")
     res = mqar_grid(
         _OracleModel(),
         seq_lens=(32, 64, 128),
         n_pairs_list=(4, 8, 16),
         vocab_size=64, n_examples=32, batch_size=16, device="cpu",
-        verbose=True,
+        verbose=True, seeds=SEEDS,
     )
-    cells = res["cells"]
-    ok = len(cells) > 0
-    for c in cells:
-        if not (c["total"] > 0 and abs(c["accuracy"] - 1.0) < 1e-9):
-            print(f"  [FALHA] célula seq_len={c['seq_len']} n_pairs={c['n_pairs']} "
-                  f"acc={c['accuracy']} (esperado 1.0)")
-            ok = False
+    ok = _check_oracle_cells(res["cells"], "pack")
     # A célula (seq_len=32, n_pairs=16) deve ser PULADA: 2*16+1+2 = 35 > 32.
     skipped_pairs = {(s["seq_len"], s["n_pairs"]) for s in res["skipped"]}
     if (32, 16) not in skipped_pairs:
@@ -296,21 +361,18 @@ def selftest() -> bool:
         ok = False
     print(f"  chance_level reportado = {res['chance_level']:.5f} (esperado {1/64:.5f})")
     ok = ok and abs(res["chance_level"] - 1 / 64) < 1e-9
+    ok = ok and res.get("seeds") == list(SEEDS)
 
     # Modo gap_fill=True: o oráculo também deve dar 1.0 (labels intactos sob ruído).
-    print("[selftest] grid MQAR gap_fill=True (distância) com oráculo...")
+    print("[selftest] grid MQAR gap_fill=True (distância), multi-seed, com oráculo...")
     res_gap = mqar_grid(
         _OracleModel(),
         seq_lens=(64, 128, 256),
         n_pairs_list=(4, 8),
         vocab_size=64, n_examples=32, batch_size=16, device="cpu",
-        verbose=True, gap_fill=True,
+        verbose=True, gap_fill=True, seeds=SEEDS,
     )
-    for c in res_gap["cells"]:
-        if not (c["total"] > 0 and abs(c["accuracy"] - 1.0) < 1e-9):
-            print(f"  [FALHA] gap célula seq_len={c['seq_len']} n_pairs={c['n_pairs']} "
-                  f"acc={c['accuracy']} (esperado 1.0)")
-            ok = False
+    ok = ok and _check_oracle_cells(res_gap["cells"], "gap")
     ok = ok and res_gap.get("gap_fill") is True and len(res_gap["cells"]) > 0
 
     print("  [OK] selftest passou" if ok else "  [FALHA] selftest falhou")
@@ -331,6 +393,8 @@ def main():
     parser.add_argument("--n_examples", type=int, default=DEFAULT_N_EXAMPLES,
                         help="exemplos por célula do grid MQAR")
     parser.add_argument("--vocab_size", type=int, default=DEFAULT_VOCAB_SIZE)
+    parser.add_argument("--n_seeds", type=int, default=len(DEFAULT_SEEDS),
+                        help="seeds do gerador p/ barras de erro (média±dp)")
     args = parser.parse_args()
 
     if args.selftest:
@@ -338,8 +402,9 @@ def main():
     if not args.checkpoint:
         raise SystemExit("Forneça --checkpoint ou use --selftest.")
 
+    seeds = tuple(range(args.n_seeds))
     sweep_checkpoint(
-        args.checkpoint, out_dir=args.out_dir,
+        args.checkpoint, out_dir=args.out_dir, seeds=seeds,
         mqar_kwargs={"n_examples": args.n_examples, "vocab_size": args.vocab_size},
         niah_kwargs={"vocab_size": args.vocab_size},
     )

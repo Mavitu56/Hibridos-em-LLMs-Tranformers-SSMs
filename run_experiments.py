@@ -197,15 +197,15 @@ def phase_b_recall(out_root="checkpoints", variants=None, out_dir=None):
             "chance": res["mqar_grid_pack"]["chance_level"],
             "out_path": res.get("out_path"),
         }
-    print(f"\nResumo Fase B+ (PPL, MQAR-pack mais difícil, NIAH mais longo):")
+    print(f"\nResumo Fase B+ (PPL, MQAR-pack mais difícil, NIAH mais longo; acc média±dp):")
     for v, s in summary.items():
         hc = s["mqar_hardest_cell"]
         nl = s["niah_longest"]
         ppl = s["ppl"]
         ppl_s = f"ppl={ppl:.2f}" if ppl is not None else "ppl=?"
-        mqar_s = (f"MQAR n_pairs={hc['n_pairs']} acc={hc['accuracy']:.4f}"
+        mqar_s = (f"MQAR n_pairs={hc['n_pairs']} acc={hc['accuracy']:.4f}±{hc.get('acc_std', 0):.4f}"
                   if hc else "MQAR=?")
-        niah_s = (f"NIAH@{nl['seq_len']}={nl['ruler_niah_accuracy']:.4f}"
+        niah_s = (f"NIAH@{nl['seq_len']}={nl['ruler_niah_accuracy']:.4f}±{nl.get('acc_std', 0):.4f}"
                   if nl else "NIAH=?")
         print(f"  {v}: {ppl_s} | {mqar_s} | {niah_s} (acaso={s['chance']:.4f})")
     return summary

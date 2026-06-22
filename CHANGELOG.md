@@ -551,3 +551,24 @@ gerador MQAR para barras de erro antes de afirmar a inversão como definitiva.
 - Trade-off memória↔atenção demonstrado nas 5 proporções, paridade ±0.4%, mesmo
   orçamento. **Pendências:** barras de erro no MQAR (multi-seed); benchmarks
   secundários (lambada/hellaswag) opcionais.
+
+## Avaliação multi-seed 2026-06-22 — barras de erro (eval/recall_sweep.py)
+
+Os números de recall acima vinham de UMA seed do gerador por célula — sem desvio
+não dá para afirmar a "inversão" (5_1/7_1 > attn; 3_1 atrás) contra a variância
+de amostragem. Implementado multi-seed (só avaliação; treino intocado):
+
+- **`mqar_grid` / `niah_sweep` / `sweep_checkpoint` agora aceitam `seeds`**
+  (default `(0,1,2,3,4)`). Cada célula é reavaliada com N conjuntos de exemplos
+  (seeds distintas) e reporta **`accuracy` (média), `acc_std` (dp amostral) e
+  `acc_per_seed`** no JSON. `n_seeds=1` reproduz o ponto único anterior. O seed
+  entra nos geradores já existentes (`generate_mqar_examples(seed=)`,
+  `evaluate_ruler(..., seed=)` → `generate_niah`), sem alterar interface pública.
+- **Validação:** selftest do oráculo passou nos dois modos (média 1.0, dp 0.0,
+  `acc_per_seed` todos 1.0); end-to-end com modelo real produz o JSON com os
+  campos novos. CLI ganhou `--n_seeds`.
+- **Custo:** ~5× o tempo de inferência do sweep (≈45–60 min de GPU p/ as 5
+  variantes com 5 seeds) — aceitável, só inferência.
+- **Próximo:** re-rodar `phase_b_recall` para gravar os JSONs COM barras de erro;
+  só então afirmar/derrubar a inversão 5_1/7_1>attn e a ordenação fina entre
+  variantes de topo. Diferenças vs ssm_only já são enormes (não dependem disto).
