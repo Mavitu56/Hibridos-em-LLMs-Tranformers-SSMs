@@ -501,3 +501,53 @@ RoPE perto do block_size=1024 de treino — registrar como nota de rodapé.
   as novas 5_1/7_1 (workers=0). Efeito desprezível — 1.5B é uma fração mínima do
   SlimPajama-6B i.i.d.; ambas são amostras aleatórias representativas. Registrado
   por transparência; não justifica retreinar as 3 anteriores.
+
+## Fase C concluída (2026-06-21) — 5 variantes, curva completa da proporção
+
+`hybrid_5_1` e `hybrid_7_1` treinados (1.5B tokens, kernels) e sweep das 5
+variantes feito. Resultado final do experimento.
+
+### Perplexidade (val fixo) — ótimo interior na proporção
+
+| variante   | M:A  | PPL    |
+|------------|------|--------|
+| attn_only  | 0:12 | 30.61  |
+| hybrid_3_1 | 9:3  | 29.07  |  ← melhor
+| hybrid_5_1 | 10:2 | 29.64  |
+| hybrid_7_1 | 11:1 | 29.52  |
+| ssm_only   | 12:0 | 32.60  |
+
+Os 3 híbridos (29.07–29.64) batem ambos os extremos puros; platô estreito entre
+eles (leve não-monotonia 5_1>7_1, dentro do ruído). Reproduz o achado de Jamba
+("1:3 a 1:7 = sweet spot, sem diferença substancial") em escala ~50M/1.5B tokens.
+
+### Recall (acc@1; acaso=0.002)
+
+| variante   | MQAR pack n=64 | MQAR gap n=8 sl=1024 | NIAH sl=1024 |
+|------------|----------------|----------------------|--------------|
+| attn_only  | 0.217          | 0.242                | 0.225        |
+| hybrid_3_1 | 0.181          | 0.116                | 0.126        |
+| hybrid_5_1 | 0.252          | 0.265                | 0.244        |
+| hybrid_7_1 | 0.233          | 0.238                | 0.243        |
+| ssm_only   | 0.024          | 0.001                | 0.006        |
+
+**Achado inesperado (registrar e investigar):** `hybrid_5_1` e `hybrid_7_1`
+IGUALAM ou SUPERAM o `attn_only` em recall (pack/gap/NIAH), e o `hybrid_3_1`
+fica ATRÁS dos outros dois híbridos — uma INVERSÃO da expectativa ingênua de que
+"mais atenção = mais recall". Hipótese principal: as posições das 2-3 camadas de
+atenção no stack importam mais que a quantidade. No 3_1 (MMMAMMMAMMMA) a 1ª
+atenção só aparece na 4ª camada; no 5_1/7_1 os blocos Mamba pré-atenção podem
+estar "resumindo" melhor o contexto antes da camada de atenção fazer o lookup
+(efeito de roteamento Mamba→atenção, reportado em análises do Jamba/Nemotron-H).
+NÃO é artefato de medição (3 tarefas independentes concordam; ssm_only colapsa e
+attn_only é robusto, como esperado). É um resultado científico próprio — merece
+uma figura (acc × proporção) e discussão; vale checar com seeds adicionais do
+gerador MQAR para barras de erro antes de afirmar a inversão como definitiva.
+
+### Quadro consolidado do TCC
+- **PPL (texto):** híbrido vence os extremos; ótimo em ~3:1, platô até 7:1 (Jamba).
+- **Recall (MQAR/NIAH):** ssm_only colapsa (gap→acaso); atenção robusta; híbridos
+  5_1/7_1 no topo. O gap por DISTÂNCIA é o eixo mais discriminante (ssm 0.001).
+- Trade-off memória↔atenção demonstrado nas 5 proporções, paridade ±0.4%, mesmo
+  orçamento. **Pendências:** barras de erro no MQAR (multi-seed); benchmarks
+  secundários (lambada/hellaswag) opcionais.
