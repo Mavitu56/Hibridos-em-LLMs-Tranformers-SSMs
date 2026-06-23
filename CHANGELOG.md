@@ -572,3 +572,37 @@ de amostragem. Implementado multi-seed (só avaliação; treino intocado):
 - **Próximo:** re-rodar `phase_b_recall` para gravar os JSONs COM barras de erro;
   só então afirmar/derrubar a inversão 5_1/7_1>attn e a ordenação fina entre
   variantes de topo. Diferenças vs ssm_only já são enormes (não dependem disto).
+
+## Resultados finais com barras de erro (2026-06-23) — 5 seeds, sweep completo
+
+Sweep multi-seed re-rodado nas 5 variantes (5 seeds; MQAR n=512/seed, NIAH
+n=200/seed). Desvios pequenos (≤0.015); significância por Welch t (gl~4,
+|t|>2.78 ⇒ p<0.05). Médias ± dp:
+
+| variante   | PPL   | MQAR carga (n=64) | MQAR dist. (sl=1024) | NIAH (sl=1024) |
+|------------|-------|-------------------|----------------------|----------------|
+| attn_only  | 30.61 | 0.2205 ± 0.0023   | 0.1148 ± 0.0081      | 0.2310 ± 0.0089|
+| hybrid_3_1 | 29.07 | 0.1832 ± 0.0016   | 0.2312 ± 0.0027      | 0.1157 ± 0.0150|
+| hybrid_5_1 | 29.64 | 0.2525 ± 0.0029   | 0.2652 ± 0.0124      | 0.2570 ± 0.0151|
+| hybrid_7_1 | 29.52 | 0.2358 ± 0.0019   | 0.2628 ± 0.0072      | 0.2297 ± 0.0116|
+| ssm_only   | 32.60 | 0.0242 ± 0.0008   | 0.0023 ± 0.0008      | 0.0035 ± 0.0027|
+
+**Conclusões estatisticamente sustentadas (a "inversão" é REAL):**
+- **hybrid_5_1/7_1 SUPERAM o attn_only em recall** — MQAR-carga: 5_1 vs attn
+  diff +0.032 (t≈19); NIAH: 5_1 vs attn +0.026 (t≈3.3). Não é ruído.
+- **hybrid_5_1 > hybrid_7_1** no MQAR-carga (t≈11) e NIAH (t≈3.2); empatam na
+  distância (t≈0.4, n.s.). O sweet spot fino de recall é o **5_1 (~17% atenção)**.
+- **hybrid_3_1**: pior que attn em carga/NIAH (t≈-15 a -30), porém MELHOR na
+  distância (gap 0.231 vs 0.115, t≈-30) — a *distribuição* das camadas de
+  atenção, não só a quantidade, modula o tipo de recall.
+- **ssm_only colapsa** nos três eixos (distância → acaso 0.002). Zoology
+  confirmado sem ambiguidade.
+
+**Quadro do TCC:** (1) SSM puro tem memória estruturalmente limitada; (2) a
+atenção pura NÃO é o teto de recall — híbridos a superam (roteamento Mamba→
+atenção, cf. Nemotron-H/Jamba); (3) há ótimo INTERIOR na proporção — PPL em ~3:1,
+recall em ~5:1, nunca os extremos. Paridade ±0.4%, 1.5B tokens, 5 seeds.
+
+- **NOVO `plot_results.py`** (matplotlib): lê os 5 JSONs de `_recall_results/` e
+  gera a figura `acc × proporção` com barras de erro (4 painéis: PPL, MQAR-carga,
+  MQAR-distância, NIAH). Para rodar no Colab ou local. Não altera nada do experimento.
